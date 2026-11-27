@@ -102,7 +102,11 @@ class PredictorService : Service() {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
-        )
+        ).apply {
+            // Android 12+ memblokir sentuhan ke aplikasi di bawah overlay yang
+            // alpha jendelanya > 0.8. Harus <= 0.8 supaya sentuhan tembus.
+            alpha = 0.8f
+        }
         windowManager.addView(overlayCanvasView, params)
     }
 
