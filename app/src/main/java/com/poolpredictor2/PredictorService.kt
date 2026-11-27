@@ -1,6 +1,18 @@
 package com.poolpredictor2
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.Service
+import android.content.pm.ServiceInfo
+import android.graphics.PixelFormat as GfxPixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.HandlerThread
+import android.util.DisplayMetrics
 import android.content.Context
 import android.content.Intent
 import android.graphics.Canvas
@@ -46,6 +58,17 @@ class PredictorService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isRunning = false
 
+    // ---- Screen capture (MediaProjection) ----
+    private var projection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+    private var captureThread: HandlerThread? = null
+    private var captureStatusText: TextView? = null
+    private var frameCount = 0
+    private var lastFpsTime = 0L
+    private var capW = 0
+    private var capH = 0
+
     private var mockAimAngleDeg = -18.5f
     private var mockCuePower = 0.72f
 
@@ -71,14 +94,126 @@ class PredictorService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val code = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
+        val data: Intent? = if (Build.VERSION.SDK_INT >= 33) {
+            intent?.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableExtra(EXTRA_RESULT_DATA)
+        }
+        if (data == null || code == 0) {
+            setCaptureStatus("Capture: tidak ada izin")
+            return START_NOT_STICKY
+        }
+        // Wajib dipanggil sebelum getMediaProjection()
+        startAsForeground()
+        startCapture(code, data)
+        return START_NOT_STICKY
+    }
+
+    private fun startAsForeground() {
+        val channelId = "pp2_capture"
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(
+                NotificationChannel(channelId, "PoolPredictor2", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, channelId)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }.setContentTitle("PoolPredictor2")
+            .setContentText("Overlay & tangkap layar aktif")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(1, notif)
+        }
+    }
+
+    private fun startCapture(resultCode: Int, data: Intent) {
+        stopCapture()
+        try {
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val mp = mpm.getMediaProjection(resultCode, data)
+            projection = mp
+
+            // Android 14+ wajib mendaftarkan callback sebelum membuat VirtualDisplay
+            mp.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    mainHandler.post { setCaptureStatus("Capture: dihentikan sistem") }
+                }
+            }, mainHandler)
+
+            val dm = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(dm)
+            capW = dm.widthPixels
+            capH = dm.heightPixels
+
+            val thread = HandlerThread("pp2-capture").also { it.start() }
+            captureThread = thread
+            val handler = Handler(thread.looper)
+
+            val reader = ImageReader.newInstance(capW, capH, GfxPixelFormat.RGBA_8888, 2)
+            imageReader = reader
+            lastFpsTime = System.currentTimeMillis()
+            frameCount = 0
+
+            reader.setOnImageAvailableListener({ r ->
+                // Frame dibuang dulu; pemrosesan vision menyusul di tahap berikutnya
+                val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                img.close()
+                frameCount++
+                val now = System.currentTimeMillis()
+                if (now - lastFpsTime >= 1000) {
+                    val fps = frameCount * 1000f / (now - lastFpsTime)
+                    frameCount = 0
+                    lastFpsTime = now
+                    mainHandler.post {
+                        setCaptureStatus("Capture: ${capW}x${capH} | %.0f fps".format(fps))
+                    }
+                }
+            }, handler)
+
+            virtualDisplay = mp.createVirtualDisplay(
+                "pp2-capture", capW, capH, dm.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                reader.surface, null, handler
+            )
+            setCaptureStatus("Capture: ${capW}x${capH} | menunggu frame...")
+        } catch (e: Exception) {
+            stopCapture()
+            setCaptureStatus("Capture gagal: ${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun stopCapture() {
+        virtualDisplay?.release(); virtualDisplay = null
+        imageReader?.close(); imageReader = null
+        projection?.stop(); projection = null
+        captureThread?.quitSafely(); captureThread = null
+    }
+
+    private fun setCaptureStatus(text: String) {
+        captureStatusText?.text = text
+    }
+
     override fun onDestroy() {
         isRunning = false
         mainHandler.removeCallbacks(renderLoop)
+        stopCapture()
         if (::overlayCanvasView.isInitialized) {
-            windowManager.removeView(overlayCanvasView)
+            try { windowManager.removeView(overlayCanvasView) } catch (_: Exception) {}
         }
         if (::controlPanelView.isInitialized) {
-            windowManager.removeView(controlPanelView)
+            try { windowManager.removeView(controlPanelView) } catch (_: Exception) {}
         }
         super.onDestroy()
     }
@@ -157,8 +292,16 @@ class PredictorService : Service() {
             })
         }
 
+        val captureText = TextView(this).apply {
+            text = "Capture: belum aktif"
+            setTextColor(theme.textPrimary)
+            textSize = 11f
+        }
+        captureStatusText = captureText
+
         container.addView(titleText)
         container.addView(infoText)
+        container.addView(captureText)
         container.addView(angleSlider)
         container.addView(powerSlider)
 
@@ -374,5 +517,10 @@ class PredictorService : Service() {
                 canvas.drawCircle(ball.position.x, ball.position.y, radius * 0.55f, mockBallPaint)
             }
         }
+    }
+
+    companion object {
+        const val EXTRA_RESULT_CODE = "capture_result_code"
+        const val EXTRA_RESULT_DATA = "capture_result_data"
     }
 }
