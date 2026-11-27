@@ -25,5 +25,3 @@ jobs:
         with:
           name: app-debug
           path: app/build/outputs/apk/debug/*.apk
-EOF
-cat .【entity-github¦canonical_name=GitHub】/workflows/build.yml
