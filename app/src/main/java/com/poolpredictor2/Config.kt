@@ -22,6 +22,25 @@ object Config {
     const val OVERLAY_TARGET_FPS = 60L
     const val FRAME_INTERVAL_MS = 1000L / OVERLAY_TARGET_FPS
 
+    // Overlay hanya digambar ulang saat ada perubahan (dirty), plus detak minimum ini
+    // supaya perubahan tema tetap terlihat. Mengurangi beban komposisi jendela overlay.
+    const val OVERLAY_HEARTBEAT_MS = 500L
+
+    // Skala resolusi capture relatif terhadap layar nyata (0.5 = setengah lebar & tinggi).
+    // Lebih kecil = lebih ringan untuk GPU/CPU. Deteksi memakai koordinat relatif,
+    // jadi nilai ini bebas diubah. Naikkan ke 0.75/1.0 nanti jika deteksi bola butuh detail.
+    const val CAPTURE_SCALE = 0.5f
+
+    // Deteksi meja: jarak antar deteksi saat belum terkunci / sudah terkunci
+    const val TABLE_DETECT_SEARCH_INTERVAL_MS = 250L
+    const val TABLE_DETECT_LOCKED_INTERVAL_MS = 1000L
+
+    // Toleransi perubahan (fraksi frame) agar posisi meja yang sudah terkunci tidak bergetar
+    const val TABLE_LOCK_TOLERANCE = 0.012f
+
+    // Jumlah deteksi gagal berturut-turut sebelum kunci meja dilepas
+    const val TABLE_MISS_LIMIT = 4
+
     /**
      * Placeholder offset memori game (Android arm64-v8a).
      * Sengaja dikosongkan sampai dilakukan reverse-engineering/dump resmi.

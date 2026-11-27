@@ -12,6 +12,10 @@ import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.HandlerThread
+import android.os.SystemClock
+import android.view.Display
+import com.poolpredictor2.vision.TableDetector
+import com.poolpredictor2.vision.TableRegion
 import android.util.DisplayMetrics
 import android.content.Context
 import android.content.Intent
@@ -63,11 +67,32 @@ class PredictorService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var captureThread: HandlerThread? = null
+    private var captureHandler: Handler? = null
+    private var displayManager: DisplayManager? = null
+    private var displayListener: DisplayManager.DisplayListener? = null
     private var captureStatusText: TextView? = null
+    private var tableStatusText: TextView? = null
     private var frameCount = 0
     private var lastFpsTime = 0L
-    private var capW = 0
-    private var capH = 0
+    @Volatile private var lastFps = 0f
+
+    // Ukuran frame capture saat ini (px) dan ukuran layar nyata (px), keduanya sesuai rotasi aktif
+    @Volatile private var capW = 0
+    @Volatile private var capH = 0
+    @Volatile private var realW = 0
+    @Volatile private var realH = 0
+    private var lastRotation = -1
+
+    // ---- Deteksi meja ----
+    @Volatile private var tableRegion: TableRegion? = null
+    @Volatile private var resetDetectionRequested = false
+    private var pendingRegion: TableRegion? = null   // hanya diakses dari thread capture
+    private var missCount = 0                         // hanya diakses dari thread capture
+    private var lastDetectTime = 0L                   // hanya diakses dari thread capture
+
+    // ---- Render on-demand ----
+    @Volatile private var overlayDirty = true
+    private var lastDrawTime = 0L
 
     private var mockAimAngleDeg = -18.5f
     private var mockCuePower = 0.72f
@@ -75,7 +100,12 @@ class PredictorService : Service() {
     private val renderLoop = object : Runnable {
         override fun run() {
             if (!isRunning) return
-            overlayCanvasView.invalidate()
+            val now = SystemClock.uptimeMillis()
+            if (overlayDirty || now - lastDrawTime >= Config.OVERLAY_HEARTBEAT_MS) {
+                overlayDirty = false
+                lastDrawTime = now
+                overlayCanvasView.invalidate()
+            }
             mainHandler.postDelayed(this, Config.FRAME_INTERVAL_MS)
         }
     }
@@ -137,6 +167,27 @@ class PredictorService : Service() {
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun readDisplayInfo(): DisplayMetrics {
+        val dm = DisplayMetrics()
+        windowManager.defaultDisplay.getRealMetrics(dm)
+        return dm
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentRotation(): Int = windowManager.defaultDisplay.rotation
+
+    private fun scaledEven(v: Int): Int {
+        val s = (v * Config.CAPTURE_SCALE).toInt()
+        return ((s / 2) * 2).coerceAtLeast(2)
+    }
+
+    private fun createReader(w: Int, h: Int, handler: Handler): ImageReader {
+        val reader = ImageReader.newInstance(w, h, GfxPixelFormat.RGBA_8888, 2)
+        reader.setOnImageAvailableListener({ r -> onFrame(r) }, handler)
+        return reader
+    }
+
     private fun startCapture(resultCode: Int, data: Intent) {
         stopCapture()
         try {
@@ -151,71 +202,217 @@ class PredictorService : Service() {
                 }
             }, mainHandler)
 
-            val dm = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.getRealMetrics(dm)
-            capW = dm.widthPixels
-            capH = dm.heightPixels
+            // Ukuran diambil dari layar NYATA saat ini (bukan dari orientasi Launcher)
+            val dm = readDisplayInfo()
+            realW = dm.widthPixels
+            realH = dm.heightPixels
+            lastRotation = currentRotation()
+            capW = scaledEven(realW)
+            capH = scaledEven(realH)
 
             val thread = HandlerThread("pp2-capture").also { it.start() }
             captureThread = thread
             val handler = Handler(thread.looper)
+            captureHandler = handler
 
-            val reader = ImageReader.newInstance(capW, capH, GfxPixelFormat.RGBA_8888, 2)
-            imageReader = reader
             lastFpsTime = System.currentTimeMillis()
             frameCount = 0
 
-            reader.setOnImageAvailableListener({ r ->
-                // Frame dibuang dulu; pemrosesan vision menyusul di tahap berikutnya
-                val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
-                img.close()
-                frameCount++
-                val now = System.currentTimeMillis()
-                if (now - lastFpsTime >= 1000) {
-                    val fps = frameCount * 1000f / (now - lastFpsTime)
-                    frameCount = 0
-                    lastFpsTime = now
-                    mainHandler.post {
-                        setCaptureStatus("Capture: ${capW}x${capH} | %.0f fps".format(fps))
-                    }
-                }
-            }, handler)
+            val reader = createReader(capW, capH, handler)
+            imageReader = reader
 
             virtualDisplay = mp.createVirtualDisplay(
                 "pp2-capture", capW, capH, dm.densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 reader.surface, null, handler
             )
-            setCaptureStatus("Capture: ${capW}x${capH} | menunggu frame...")
+
+            // Pantau perubahan rotasi/ukuran layar supaya frame selalu mengikuti orientasi aktif
+            val dispMgr = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+            displayManager = dispMgr
+            val listener = object : DisplayManager.DisplayListener {
+                override fun onDisplayAdded(displayId: Int) {}
+                override fun onDisplayRemoved(displayId: Int) {}
+                override fun onDisplayChanged(displayId: Int) {
+                    if (displayId == Display.DEFAULT_DISPLAY) onDisplayMaybeChanged()
+                }
+            }
+            displayListener = listener
+            dispMgr.registerDisplayListener(listener, mainHandler)
+
+            refreshStatus()
         } catch (e: Exception) {
             stopCapture()
             setCaptureStatus("Capture gagal: ${e.javaClass.simpleName}")
         }
     }
 
+    /**
+     * Dipanggil di main thread saat layar berubah. Memeriksa ukuran DAN rotasi nyata:
+     * rotasi 180 derajat tidak mengubah lebar/tinggi tetapi membalik isi frame,
+     * jadi deteksi tetap harus diulang.
+     */
+    private fun onDisplayMaybeChanged() {
+        val vd = virtualDisplay ?: return
+        val handler = captureHandler ?: return
+        val dm = readDisplayInfo()
+        val rot = currentRotation()
+        val newW = scaledEven(dm.widthPixels)
+        val newH = scaledEven(dm.heightPixels)
+
+        realW = dm.widthPixels
+        realH = dm.heightPixels
+
+        val rotationChanged = rot != lastRotation
+        val sizeChanged = newW != capW || newH != capH
+        lastRotation = rot
+        if (!rotationChanged && !sizeChanged) {
+            overlayDirty = true
+            return
+        }
+
+        if (sizeChanged) {
+            val newReader = createReader(newW, newH, handler)
+            val oldReader = imageReader
+            try {
+                vd.resize(newW, newH, dm.densityDpi)
+                vd.surface = newReader.surface
+            } catch (e: Exception) {
+                newReader.close()
+                setCaptureStatus("Capture gagal resize: ${e.javaClass.simpleName}")
+                return
+            }
+            imageReader = newReader
+            capW = newW
+            capH = newH
+            oldReader?.close()
+        }
+
+        // Posisi meja lama tidak berlaku lagi untuk orientasi/rotasi baru
+        tableRegion = null
+        resetDetectionRequested = true
+        overlayDirty = true
+        refreshStatus()
+    }
+
+    /** Dipanggil di thread capture untuk setiap frame. */
+    private fun onFrame(reader: ImageReader) {
+        try {
+            val img = reader.acquireLatestImage() ?: return
+            try {
+                frameCount++
+                val now = System.currentTimeMillis()
+                if (now - lastFpsTime >= 1000) {
+                    lastFps = frameCount * 1000f / (now - lastFpsTime)
+                    frameCount = 0
+                    lastFpsTime = now
+                    mainHandler.post { refreshStatus() }
+                }
+
+                if (resetDetectionRequested) {
+                    resetDetectionRequested = false
+                    pendingRegion = null
+                    missCount = 0
+                    lastDetectTime = 0L
+                }
+
+                // Frame sisa dari ukuran lama (sesaat setelah resize) dilewati.
+                // Ukuran diambil dari frame itu sendiri, bukan diasumsikan.
+                if (img.width != capW || img.height != capH) return
+
+                val interval = if (tableRegion == null) {
+                    Config.TABLE_DETECT_SEARCH_INTERVAL_MS
+                } else {
+                    Config.TABLE_DETECT_LOCKED_INTERVAL_MS
+                }
+                val uptime = SystemClock.uptimeMillis()
+                if (uptime - lastDetectTime < interval) return
+                lastDetectTime = uptime
+
+                val plane = img.planes[0]
+                val region = TableDetector.detect(
+                    plane.buffer, img.width, img.height, plane.rowStride, plane.pixelStride
+                )
+                handleDetection(region)
+            } finally {
+                img.close()
+            }
+        } catch (e: Exception) {
+            // Reader bisa sudah ditutup saat resize; abaikan
+        }
+    }
+
+    private fun closeTo(a: TableRegion, b: TableRegion): Boolean {
+        val tol = Config.TABLE_LOCK_TOLERANCE
+        return kotlin.math.abs(a.left - b.left) <= tol &&
+            kotlin.math.abs(a.top - b.top) <= tol &&
+            kotlin.math.abs(a.right - b.right) <= tol &&
+            kotlin.math.abs(a.bottom - b.bottom) <= tol
+    }
+
+    /** Thread capture. Meja baru dikunci setelah dua deteksi berturut-turut yang sama. */
+    private fun handleDetection(region: TableRegion?) {
+        if (region == null) {
+            pendingRegion = null
+            missCount++
+            if (missCount >= Config.TABLE_MISS_LIMIT && tableRegion != null) {
+                tableRegion = null
+                overlayDirty = true
+                mainHandler.post { refreshStatus() }
+            }
+            return
+        }
+        missCount = 0
+
+        val current = tableRegion
+        if (current != null && closeTo(current, region)) {
+            pendingRegion = null
+            return
+        }
+
+        val pending = pendingRegion
+        if (pending != null && closeTo(pending, region)) {
+            tableRegion = region
+            pendingRegion = null
+            overlayDirty = true
+            mainHandler.post { refreshStatus() }
+        } else {
+            pendingRegion = region
+        }
+    }
+
     private fun stopCapture() {
+        displayListener?.let { displayManager?.unregisterDisplayListener(it) }
+        displayListener = null
+        displayManager = null
         virtualDisplay?.release(); virtualDisplay = null
         imageReader?.close(); imageReader = null
         projection?.stop(); projection = null
         captureThread?.quitSafely(); captureThread = null
+        captureHandler = null
+        tableRegion = null
     }
 
     private fun setCaptureStatus(text: String) {
         captureStatusText?.text = text
     }
 
-    override fun onDestroy() {
-        isRunning = false
-        mainHandler.removeCallbacks(renderLoop)
-        stopCapture()
-        if (::overlayCanvasView.isInitialized) {
-            try { windowManager.removeView(overlayCanvasView) } catch (_: Exception) {}
+    /** Main thread. Menampilkan ukuran frame, rotasi nyata, fps, dan status meja. */
+    private fun refreshStatus() {
+        if (virtualDisplay != null) {
+            captureStatusText?.text =
+                "Capture: ${capW}x${capH} | rot ${lastRotation * 90}° | %.0f fps".format(lastFps)
         }
-        if (::controlPanelView.isInitialized) {
-            try { windowManager.removeView(controlPanelView) } catch (_: Exception) {}
+        val t = tableRegion
+        tableStatusText?.text = if (virtualDisplay == null) {
+            "Meja: -"
+        } else if (t == null) {
+            "Meja: mencari..."
+        } else {
+            val w = ((t.right - t.left) * realW).toInt()
+            val h = ((t.bottom - t.top) * realH).toInt()
+            "Meja: ${w}x${h} px"
         }
-        super.onDestroy()
     }
 
     private fun getOverlayLayoutType(): Int {
@@ -272,6 +469,7 @@ class PredictorService : Service() {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                     mockAimAngleDeg = progress - 180f
+                    overlayDirty = true
                     infoText.text = "Angle: ${"%.1f".format(mockAimAngleDeg)}° | Power: ${(mockCuePower * 100).toInt()}%"
                 }
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
@@ -285,6 +483,7 @@ class PredictorService : Service() {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                     mockCuePower = (progress.coerceAtLeast(5)) / 100f
+                    overlayDirty = true
                     infoText.text = "Angle: ${"%.1f".format(mockAimAngleDeg)}° | Power: ${(mockCuePower * 100).toInt()}%"
                 }
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
@@ -299,9 +498,17 @@ class PredictorService : Service() {
         }
         captureStatusText = captureText
 
+        val tableText = TextView(this).apply {
+            text = "Meja: -"
+            setTextColor(theme.textPrimary)
+            textSize = 11f
+        }
+        tableStatusText = tableText
+
         container.addView(titleText)
         container.addView(infoText)
         container.addView(captureText)
+        container.addView(tableText)
         container.addView(angleSlider)
         container.addView(powerSlider)
 
@@ -352,6 +559,14 @@ class PredictorService : Service() {
             strokeWidth = 4f
         }
 
+        private val locOnScreen = IntArray(2)
+
+        private val pocketMarkerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 3f
+            color = Color.YELLOW
+        }
+
         private val cueLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
             strokeWidth = 5f
@@ -391,14 +606,33 @@ class PredictorService : Service() {
             super.onDraw(canvas)
             val theme = themeManager.currentTheme
 
-            val marginX = width * 0.12f
-            val marginY = height * 0.16f
-            val tableBounds = ShotGeometry.TableBounds(
-                left = marginX,
-                top = marginY,
-                right = width - marginX,
-                bottom = height - marginY
-            )
+            // Batas meja: dari hasil deteksi kain (koordinat relatif frame -> layar -> view).
+            // Hanya dipakai jika orientasi deteksi sama dengan orientasi layar saat ini.
+            val region = tableRegion
+            val rw = realW
+            val rh = realH
+            val detected = region != null && rw > 0 && rh > 0 &&
+                region.isLandscape == (rw >= rh)
+
+            val tableBounds = if (detected && region != null) {
+                getLocationOnScreen(locOnScreen)
+                ShotGeometry.TableBounds(
+                    left = region.left * rw - locOnScreen[0],
+                    top = region.top * rh - locOnScreen[1],
+                    right = region.right * rw - locOnScreen[0],
+                    bottom = region.bottom * rh - locOnScreen[1]
+                )
+            } else {
+                // Cadangan (mock) sampai meja terdeteksi; kotak tepi tidak digambar
+                val marginX = width * 0.12f
+                val marginY = height * 0.16f
+                ShotGeometry.TableBounds(
+                    left = marginX,
+                    top = marginY,
+                    right = width - marginX,
+                    bottom = height - marginY
+                )
+            }
             val ballRadius = (tableBounds.height * 0.032f).coerceAtLeast(14f)
 
             val midX = (tableBounds.left + tableBounds.right) * 0.5f
@@ -411,14 +645,23 @@ class PredictorService : Service() {
                 ShotGeometry.Vec2(tableBounds.right, tableBounds.bottom)
             )
 
-            tableBorderPaint.color = theme.accent
-            canvas.drawRect(
-                tableBounds.left,
-                tableBounds.top,
-                tableBounds.right,
-                tableBounds.bottom,
-                tableBorderPaint
-            )
+            if (detected) {
+                // Gambar sedikit DI LUAR kain (di bantalan/rel) supaya garis overlay
+                // tidak tertangkap sebagai bagian kain pada deteksi berikutnya.
+                tableBorderPaint.color = theme.accent
+                val pad = tableBorderPaint.strokeWidth
+                canvas.drawRect(
+                    tableBounds.left - pad,
+                    tableBounds.top - pad,
+                    tableBounds.right + pad,
+                    tableBounds.bottom + pad,
+                    tableBorderPaint
+                )
+                // Penanda enam pocket (empat sudut + tengah sisi panjang)
+                pockets.forEach { pocket ->
+                    canvas.drawCircle(pocket.x, pocket.y, 12f, pocketMarkerPaint)
+                }
+            }
 
             val cueBall = ShotGeometry.BallState(
                 number = 0,
