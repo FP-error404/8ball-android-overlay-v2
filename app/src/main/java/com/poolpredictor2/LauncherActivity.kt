@@ -1,10 +1,17 @@
 
 package com.poolpredictor2
 
+import android.app.Activity
+import android.content.Context
 import android.content.Intent
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import android.os.Bundle
 import android.view.View
 import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 
 class LauncherActivity : AppCompatActivity() {
@@ -14,6 +21,29 @@ class LauncherActivity : AppCompatActivity() {
 
     // ThemeManager harus dibuat sebagai instance
     private lateinit var themeManager: ThemeManager
+
+    // Hasil dialog izin tangkap layar (MediaProjection)
+    private val captureLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == Activity.RESULT_OK && data != null) {
+            val intent = Intent(this, PredictorService::class.java).apply {
+                putExtra("power", powerRatio)
+                putExtra("targetNumber", targetNumber)
+                putExtra(PredictorService.EXTRA_RESULT_CODE, result.resultCode)
+                putExtra(PredictorService.EXTRA_RESULT_DATA, data)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+            Toast.makeText(this, "Overlay + capture jalan", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Izin tangkap layar ditolak", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -155,22 +185,13 @@ class LauncherActivity : AppCompatActivity() {
         }
 
         startBtn.setOnClickListener {
-
-            val intent = Intent(
-                this@LauncherActivity,
-                PredictorService::class.java
-            )
-
-            intent.putExtra("power", powerRatio)
-            intent.putExtra("targetNumber", targetNumber)
-
-            startService(intent)
-
-            Toast.makeText(
-                this@LauncherActivity,
-                "Overlay jalan, 2 garis",
-                Toast.LENGTH_SHORT
-            ).show()
+            if (!Settings.canDrawOverlays(this)) {
+                Toast.makeText(this, "Aktifkan izin 'Tampilkan di atas aplikasi lain' dulu", Toast.LENGTH_LONG).show()
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                return@setOnClickListener
+            }
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            captureLauncher.launch(mpm.createScreenCaptureIntent())
         }
 
         layout.addView(startBtn)
