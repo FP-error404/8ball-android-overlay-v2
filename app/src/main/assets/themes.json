@@ -1,0 +1,43 @@
+{
+  "active_theme": "blood_moon",
+  "themes": {
+    "blood_moon": {
+      "name": "Blood Moon",
+      "background": "#0B080A",
+      "panel": "#171014",
+      "panelSecondary": "#21151A",
+      "accent": "#B00020",
+      "highlight": "#FF1744",
+      "border": "#49101D",
+      "text_primary": "#F5EEF0",
+      "text_secondary": "#A8999E",
+      "text_disabled": "#665A5F"
+    },
+    "obsidian_stealth": {
+      "name": "Obsidian Stealth",
+      "background": "#090A0F",
+      "panel": "#131620",
+      "accent": "#37474F",
+      "highlight": "#78909C",
+      "text_primary": "#ECEFF1",
+      "text_secondary": "#90A4AE"
+    }
+  },
+  "ballColors": {
+    "1": "#FFD600",
+    "2": "#2196F3",
+    "3": "#F44336",
+    "4": "#9C27B0",
+    "5": "#FF9800",
+    "6": "#4CAF50",
+    "7": "#795548",
+    "8": "#111111",
+    "9": "#FFD600",
+    "10": "#2196F3",
+    "11": "#F44336",
+    "12": "#9C27B0",
+    "13": "#FF9800",
+    "14": "#4CAF50",
+    "15": "#795548"
+  }
+}
