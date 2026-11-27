@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
+        android:allowBackup="false"
         android:label="PoolPredictor2"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
 
@@ -23,8 +24,8 @@
 
         <service
             android:name=".PredictorService"
-            android:foregroundServiceType="mediaProjection"
-            android:exported="false" />
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
 
     </application>
 
