@@ -41,6 +41,10 @@ object Config {
     // Jumlah deteksi gagal berturut-turut sebelum kunci meja dilepas
     const val TABLE_MISS_LIMIT = 4
 
+    // Deteksi bola putih: jarak antar deteksi dan jumlah gagal berturut-turut sebelum dianggap hilang
+    const val CUE_DETECT_INTERVAL_MS = 100L
+    const val CUE_MISS_LIMIT = 6
+
     /**
      * Placeholder offset memori game (Android arm64-v8a).
      * Sengaja dikosongkan sampai dilakukan reverse-engineering/dump resmi.

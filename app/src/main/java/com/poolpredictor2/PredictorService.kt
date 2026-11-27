@@ -14,6 +14,8 @@ import android.media.projection.MediaProjectionManager
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.view.Display
+import com.poolpredictor2.vision.CueBallDetector
+import com.poolpredictor2.vision.CueBallState
 import com.poolpredictor2.vision.TableDetector
 import com.poolpredictor2.vision.TableRegion
 import android.util.DisplayMetrics
@@ -89,6 +91,12 @@ class PredictorService : Service() {
     private var pendingRegion: TableRegion? = null   // hanya diakses dari thread capture
     private var missCount = 0                         // hanya diakses dari thread capture
     private var lastDetectTime = 0L                   // hanya diakses dari thread capture
+
+    // ---- Deteksi bola putih ----
+    @Volatile private var detectedCue: CueBallState? = null
+    private var cueMissCount = 0          // hanya diakses dari thread capture
+    private var lastCueTime = 0L          // hanya diakses dari thread capture
+    private var cueStatusText: TextView? = null
 
     // ---- Render on-demand ----
     @Volatile private var overlayDirty = true
@@ -290,6 +298,7 @@ class PredictorService : Service() {
 
         // Posisi meja lama tidak berlaku lagi untuk orientasi/rotasi baru
         tableRegion = null
+        detectedCue = null
         resetDetectionRequested = true
         overlayDirty = true
         refreshStatus()
@@ -314,6 +323,8 @@ class PredictorService : Service() {
                     pendingRegion = null
                     missCount = 0
                     lastDetectTime = 0L
+                    cueMissCount = 0
+                    lastCueTime = 0L
                 }
 
                 // Frame sisa dari ukuran lama (sesaat setelah resize) dilewati.
@@ -326,14 +337,33 @@ class PredictorService : Service() {
                     Config.TABLE_DETECT_LOCKED_INTERVAL_MS
                 }
                 val uptime = SystemClock.uptimeMillis()
-                if (uptime - lastDetectTime < interval) return
-                lastDetectTime = uptime
+                val tableDue = uptime - lastDetectTime >= interval
+                val cueDue = tableRegion != null &&
+                    uptime - lastCueTime >= Config.CUE_DETECT_INTERVAL_MS
+                if (!tableDue && !cueDue) return
 
                 val plane = img.planes[0]
-                val region = TableDetector.detect(
-                    plane.buffer, img.width, img.height, plane.rowStride, plane.pixelStride
-                )
-                handleDetection(region)
+                if (tableDue) {
+                    lastDetectTime = uptime
+                    val region = TableDetector.detect(
+                        plane.buffer, img.width, img.height, plane.rowStride, plane.pixelStride
+                    )
+                    handleDetection(region)
+                }
+
+                // Bola putih dicari hanya di dalam meja yang sudah terkunci
+                val table = tableRegion
+                if (cueDue && table != null) {
+                    lastCueTime = uptime
+                    val cue = CueBallDetector.detect(
+                        plane.buffer, img.width, img.height, plane.rowStride, plane.pixelStride,
+                        (table.left * img.width).toInt(),
+                        (table.top * img.height).toInt(),
+                        (table.right * img.width).toInt(),
+                        (table.bottom * img.height).toInt()
+                    )
+                    handleCue(cue)
+                }
             } finally {
                 img.close()
             }
@@ -381,6 +411,23 @@ class PredictorService : Service() {
         }
     }
 
+    /** Thread capture. Bola putih mengikuti deteksi terbaru; dilepas setelah beberapa kali tidak ditemukan. */
+    private fun handleCue(cue: CueBallState?) {
+        if (cue != null) {
+            cueMissCount = 0
+            detectedCue = cue
+            overlayDirty = true
+            mainHandler.post { refreshStatus() }
+        } else {
+            cueMissCount++
+            if (cueMissCount >= Config.CUE_MISS_LIMIT && detectedCue != null) {
+                detectedCue = null
+                overlayDirty = true
+                mainHandler.post { refreshStatus() }
+            }
+        }
+    }
+
     private fun stopCapture() {
         displayListener?.let { displayManager?.unregisterDisplayListener(it) }
         displayListener = null
@@ -391,6 +438,7 @@ class PredictorService : Service() {
         captureThread?.quitSafely(); captureThread = null
         captureHandler = null
         tableRegion = null
+        detectedCue = null
     }
 
     private fun setCaptureStatus(text: String) {
@@ -402,6 +450,14 @@ class PredictorService : Service() {
         if (virtualDisplay != null) {
             captureStatusText?.text =
                 "Capture: ${capW}x${capH} | rot ${lastRotation * 90}° | %.0f fps".format(lastFps)
+        }
+        val cue = detectedCue
+        cueStatusText?.text = if (virtualDisplay == null || tableRegion == null) {
+            "Bola putih: -"
+        } else if (cue == null) {
+            "Bola putih: mencari..."
+        } else {
+            "Bola putih: (${(cue.x * realW).toInt()}, ${(cue.y * realH).toInt()})"
         }
         val t = tableRegion
         tableStatusText?.text = if (virtualDisplay == null) {
@@ -518,10 +574,18 @@ class PredictorService : Service() {
         }
         tableStatusText = tableText
 
+        val cueText = TextView(this).apply {
+            text = "Bola putih: -"
+            setTextColor(theme.textPrimary)
+            textSize = 11f
+        }
+        cueStatusText = cueText
+
         container.addView(titleText)
         container.addView(infoText)
         container.addView(captureText)
         container.addView(tableText)
+        container.addView(cueText)
         container.addView(angleSlider)
         container.addView(powerSlider)
 
@@ -573,6 +637,12 @@ class PredictorService : Service() {
         }
 
         private val locOnScreen = IntArray(2)
+
+        private val cueMarkerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 3f
+            color = Color.rgb(0, 230, 118)
+        }
 
         private val pocketMarkerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -676,13 +746,28 @@ class PredictorService : Service() {
                 }
             }
 
-            val cueBall = ShotGeometry.BallState(
-                number = 0,
-                position = ShotGeometry.Vec2(
-                    tableBounds.left + tableBounds.width * 0.28f,
-                    tableBounds.top + tableBounds.height * 0.58f
+            // Bola putih: posisi asli dari deteksi jika meja & bola putih terdeteksi,
+            // selain itu posisi mock lama (hanya saat meja belum terdeteksi).
+            val cueState = detectedCue
+            val useRealCue = detected && cueState != null
+            val cueBall = if (cueState != null && useRealCue) {
+                getLocationOnScreen(locOnScreen)
+                ShotGeometry.BallState(
+                    number = 0,
+                    position = ShotGeometry.Vec2(
+                        cueState.x * rw - locOnScreen[0],
+                        cueState.y * rh - locOnScreen[1]
+                    )
                 )
-            )
+            } else {
+                ShotGeometry.BallState(
+                    number = 0,
+                    position = ShotGeometry.Vec2(
+                        tableBounds.left + tableBounds.width * 0.28f,
+                        tableBounds.top + tableBounds.height * 0.58f
+                    )
+                )
+            }
 
             val mockObjectBalls = listOf(
                 ShotGeometry.BallState(
@@ -709,9 +794,24 @@ class PredictorService : Service() {
             )
 
             if (Config.USE_MOCK_DATA) {
-                drawMockBall(canvas, cueBall, ballRadius)
+                // Bola putih mock hanya di mode cadangan; bola putih palsu akan
+                // tertangkap capture dan mengganggu deteksi bola putih asli.
+                if (!detected) drawMockBall(canvas, cueBall, ballRadius)
                 mockObjectBalls.forEach { drawMockBall(canvas, it, ballRadius) }
             }
+
+            if (useRealCue) {
+                // Cincin hijau di luar bola putih asli (bukan warna putih, tidak ikut terdeteksi)
+                canvas.drawCircle(
+                    cueBall.position.x,
+                    cueBall.position.y,
+                    ballRadius + 4f,
+                    cueMarkerPaint
+                )
+            }
+
+            // Meja sudah terdeteksi tetapi bola putih belum: jangan gambar garis dari posisi palsu
+            if (detected && cueState == null) return
 
             val angleRad = (mockAimAngleDeg * PI / 180.0).toFloat()
             val prediction = ShotGeometry.calculateShot(
