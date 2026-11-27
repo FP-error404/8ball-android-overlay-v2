@@ -415,6 +415,19 @@ class PredictorService : Service() {
         }
     }
 
+    override fun onDestroy() {
+        isRunning = false
+        mainHandler.removeCallbacks(renderLoop)
+        stopCapture()
+        if (::overlayCanvasView.isInitialized) {
+            try { windowManager.removeView(overlayCanvasView) } catch (_: Exception) {}
+        }
+        if (::controlPanelView.isInitialized) {
+            try { windowManager.removeView(controlPanelView) } catch (_: Exception) {}
+        }
+        super.onDestroy()
+    }
+
     private fun getOverlayLayoutType(): Int {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
