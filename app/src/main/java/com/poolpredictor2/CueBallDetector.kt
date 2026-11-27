@@ -5,7 +5,7 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Posisi bola putih dalam koordinat RELATIF frame (0..1).
+ * Posisi bola putih dalam koordinat RELATIF frame (0-1).
  * radius dinyatakan relatif terhadap LEBAR frame.
  */
 data class CueBallState(
@@ -38,7 +38,7 @@ object CueBallDetector {
     private const val STEP = 2
 
     /**
-     * @param roiLeft..roiBottom area pencarian (piksel frame), biasanya batas meja.
+     * @param roiLeft, roiTop, roiRight, roiBottom area pencarian (piksel frame), biasanya batas meja.
      */
     fun detect(
         buf: ByteBuffer,
