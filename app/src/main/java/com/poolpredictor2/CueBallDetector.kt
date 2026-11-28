@@ -5,7 +5,7 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Posisi bola putih dalam koordinat RELATIF frame (0-1).
+ * Posisi bola putih dalam koordinat RELATIF frame (0..1).
  * radius dinyatakan relatif terhadap LEBAR frame.
  */
 data class CueBallState(
@@ -18,28 +18,29 @@ data class CueBallState(
 /**
  * Deteksi bola putih (cue ball) di dalam area meja.
  *
- * Pendekatan: skor "cakram putih" memakai integral image.
- * - Piksel dianggap putih-krem jika terang dan TIDAK kebiruan (b <= r + 6). Syarat ini
- *   membuat bola/garis buatan overlay sendiri (putih bercampur kain biru) tidak ikut terhitung.
- * - Untuk tiap titik kandidat dihitung rasio putih di persegi dalam (di dalam bola)
- *   dan di cincin luar (sekitar bola). Bola putih = dalam padat putih, luar nyaris tidak putih.
- * - Cara ini tahan terhadap garis bidik game yang memotong bola, karena tidak butuh
- *   bentuk bola yang utuh.
+ * 1. Skor "cakram putih" memakai integral image: bagian dalam bola padat putih-krem,
+ *    cincin di sekelilingnya nyaris tidak putih. Piksel kebiruan tidak dihitung, jadi
+ *    bola/garis buatan overlay sendiri tidak ikut terdeteksi.
+ * 2. Kandidat dipilih dengan non-max suppression, lalu DIVERIFIKASI: bola putih asli
+ *    tidak punya warna jenuh di dalamnya, sedangkan bola belang 9-15 punya pita berwarna.
+ *    Ini mencegah bola belang yang area putihnya besar dianggap bola putih.
+ * 3. Jika tidak ada kandidat yang lolos (misalnya bola putih masuk lubang), hasilnya null.
  *
  * Hanya membaca buffer; tidak mengubah apa pun.
  */
 object CueBallDetector {
 
-    // Radius bagian putih bola relatif terhadap lebar meja (hasil ukur pada frame nyata)
+    // Radius bagian putih bola dan radius visual bola, relatif terhadap lebar meja
     private const val RADIUS_TABLE_FRACTION = 0.0122f
+    private const val BALL_TABLE_FRACTION = 0.0145f
 
-    private const val INNER_MIN = 0.70f
+    private const val INNER_MIN = 0.65f
     private const val RING_MAX = 0.30f
+    private const val COLORED_MAX = 0.06f
+    private const val COLOR_SPREAD_MIN = 85
+    private const val MAX_VERIFIED = 8
     private const val STEP = 2
 
-    /**
-     * @param roiLeft, roiTop, roiRight, roiBottom area pencarian (piksel frame), biasanya batas meja.
-     */
     fun detect(
         buf: ByteBuffer,
         width: Int,
@@ -80,20 +81,22 @@ object CueBallDetector {
                 integral[y1 * iw + x0] + integral[y0 * iw + x0]
         }
 
-        val radiusPx = RADIUS_TABLE_FRACTION * (r - l)
-        val si = max(2, Math.round(1.4f * radiusPx / STEP))
-        val sm = max(si + 2, Math.round(2.2f * radiusPx / STEP))
-        val so = max(sm + 2, Math.round(3.4f * radiusPx / STEP))
+        val tableW = (r - l).toFloat()
+        val whiteRadiusPx = RADIUS_TABLE_FRACTION * tableW
+        val ballRadiusPx = BALL_TABLE_FRACTION * tableW
+        val si = max(2, Math.round(1.4f * whiteRadiusPx / STEP))
+        val sm = max(si + 2, Math.round(2.2f * whiteRadiusPx / STEP))
+        val so = max(sm + 2, Math.round(3.4f * whiteRadiusPx / STEP))
         val margin = so / 2
         if (gw <= so || gh <= so) return null
 
         val innerArea = (si * si).toFloat()
         val ringArea = (so * so - sm * sm).toFloat()
 
-        var bestScore = 0f
-        var bestX = -1
-        var bestY = -1
-
+        // ---- Kumpulkan kandidat yang lolos skor cakram ----
+        val candCx = ArrayList<Int>()
+        val candCy = ArrayList<Int>()
+        val candScore = ArrayList<Float>()
         for (cy in margin until gh - margin) {
             for (cx in margin until gw - margin) {
                 val inner = boxSum(cy - si / 2, cx - si / 2, si) / innerArea
@@ -102,32 +105,70 @@ object CueBallDetector {
                 val wo = boxSum(cy - so / 2, cx - so / 2, so)
                 val ring = (wo - wm) / ringArea
                 if (ring > RING_MAX) continue
-                val score = inner - ring
-                if (score > bestScore) {
-                    bestScore = score
-                    bestX = cx
-                    bestY = cy
-                }
+                candCx.add(cx)
+                candCy.add(cy)
+                candScore.add(inner - ring)
             }
         }
-        if (bestX < 0) return null
+        if (candScore.isEmpty()) return null
 
-        // ---- Haluskan: titik berat piksel putih di sekitar puncak (resolusi piksel penuh) ----
-        val cxPx = l + bestX * STEP
-        val cyPx = t + bestY * STEP
-        val win = Math.round(radiusPx * 1.1f)
+        val order = candScore.indices.sortedByDescending { candScore[it] }
+
+        // ---- Non-max suppression + verifikasi warna ----
+        val minSep = 2f * ballRadiusPx
+        val minSep2 = minSep * minSep
+        val keptX = ArrayList<Int>()
+        val keptY = ArrayList<Int>()
+        val verifyR = Math.round(0.85f * ballRadiusPx)
+
+        var bestRank = -1f
+        var bestPx = -1
+        var bestPy = -1
+        var bestScore = 0f
+
+        for (i in order) {
+            val px = l + candCx[i] * STEP
+            val py = t + candCy[i] * STEP
+            var near = false
+            for (k in keptX.indices) {
+                val dx = (px - keptX[k]).toFloat()
+                val dy = (py - keptY[k]).toFloat()
+                if (dx * dx + dy * dy < minSep2) { near = true; break }
+            }
+            if (near) continue
+            keptX.add(px)
+            keptY.add(py)
+
+            val coloredFraction = coloredFraction(
+                buf, width, height, rowStride, pixelStride, px, py, verifyR
+            )
+            if (coloredFraction >= 0f && coloredFraction <= COLORED_MAX) {
+                val rank = candScore[i] - 2f * coloredFraction
+                if (rank > bestRank) {
+                    bestRank = rank
+                    bestPx = px
+                    bestPy = py
+                    bestScore = candScore[i]
+                }
+            }
+            if (keptX.size >= MAX_VERIFIED) break
+        }
+        if (bestPx < 0) return null
+
+        // ---- Haluskan: titik berat piksel putih di sekitar kandidat (piksel penuh) ----
+        val win = Math.round(whiteRadiusPx * 1.1f)
         var sumX = 0L
         var sumY = 0L
         var count = 0
-        val y0 = max(t, cyPx - win)
-        val y1 = min(b - 1, cyPx + win)
-        val x0 = max(l, cxPx - win)
-        val x1 = min(r - 1, cxPx + win)
+        val y0 = max(t, bestPy - win)
+        val y1 = min(b - 1, bestPy + win)
+        val x0 = max(l, bestPx - win)
+        val x1 = min(r - 1, bestPx + win)
         val win2 = win.toLong() * win
         for (y in y0..y1) {
             for (x in x0..x1) {
-                val dx = (x - cxPx).toLong()
-                val dy = (y - cyPx).toLong()
+                val dx = (x - bestPx).toLong()
+                val dy = (y - bestPy).toLong()
                 if (dx * dx + dy * dy > win2) continue
                 if (isWhite(buf, y * rowStride + x * pixelStride)) {
                     sumX += x
@@ -141,9 +182,39 @@ object CueBallDetector {
         return CueBallState(
             x = (sumX.toFloat() / count) / width,
             y = (sumY.toFloat() / count) / height,
-            radius = radiusPx / width,
+            radius = whiteRadiusPx / width,
             score = bestScore
         )
+    }
+
+    /** Pecahan piksel berwarna jenuh di dalam cakram. -1 jika cakram keluar dari frame. */
+    private fun coloredFraction(
+        buf: ByteBuffer,
+        width: Int,
+        height: Int,
+        rowStride: Int,
+        pixelStride: Int,
+        cx: Int,
+        cy: Int,
+        rd: Int
+    ): Float {
+        if (cx - rd < 0 || cy - rd < 0 || cx + rd >= width || cy + rd >= height) return -1f
+        var total = 0
+        var colored = 0
+        val rd2 = rd * rd
+        for (dy in -rd..rd) {
+            for (dx in -rd..rd) {
+                if (dx * dx + dy * dy > rd2) continue
+                val idx = (cy + dy) * rowStride + (cx + dx) * pixelStride
+                if (idx < 0 || idx + 2 >= buf.limit()) continue
+                val rr = buf.get(idx).toInt() and 0xFF
+                val gg = buf.get(idx + 1).toInt() and 0xFF
+                val bb = buf.get(idx + 2).toInt() and 0xFF
+                total++
+                if (max(rr, max(gg, bb)) - min(rr, min(gg, bb)) > COLOR_SPREAD_MIN) colored++
+            }
+        }
+        return if (total == 0) -1f else colored.toFloat() / total
     }
 
     private fun isWhite(buf: ByteBuffer, idx: Int): Boolean {

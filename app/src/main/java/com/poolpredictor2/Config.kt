@@ -45,6 +45,9 @@ object Config {
     const val CUE_DETECT_INTERVAL_MS = 100L
     const val CUE_MISS_LIMIT = 6
 
+    // Stik: jumlah gagal berturut-turut sebelum sudut kembali ke slider manual
+    const val STICK_MISS_LIMIT = 5
+
     /**
      * Placeholder offset memori game (Android arm64-v8a).
      * Sengaja dikosongkan sampai dilakukan reverse-engineering/dump resmi.

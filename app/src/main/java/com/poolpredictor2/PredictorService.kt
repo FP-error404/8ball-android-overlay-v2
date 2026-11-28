@@ -16,6 +16,8 @@ import android.os.SystemClock
 import android.view.Display
 import com.poolpredictor2.vision.CueBallDetector
 import com.poolpredictor2.vision.CueBallState
+import com.poolpredictor2.vision.StickDetector
+import com.poolpredictor2.vision.StickState
 import com.poolpredictor2.vision.TableDetector
 import com.poolpredictor2.vision.TableRegion
 import android.util.DisplayMetrics
@@ -97,6 +99,11 @@ class PredictorService : Service() {
     private var cueMissCount = 0          // hanya diakses dari thread capture
     private var lastCueTime = 0L          // hanya diakses dari thread capture
     private var cueStatusText: TextView? = null
+
+    // ---- Stik / sudut bidik asli ----
+    @Volatile private var detectedAim: StickState? = null
+    private var stickMissCount = 0        // hanya diakses dari thread capture
+    private var stickStatusText: TextView? = null
 
     // ---- Render on-demand ----
     @Volatile private var overlayDirty = true
@@ -299,6 +306,7 @@ class PredictorService : Service() {
         // Posisi meja lama tidak berlaku lagi untuk orientasi/rotasi baru
         tableRegion = null
         detectedCue = null
+        detectedAim = null
         resetDetectionRequested = true
         overlayDirty = true
         refreshStatus()
@@ -325,6 +333,7 @@ class PredictorService : Service() {
                     lastDetectTime = 0L
                     cueMissCount = 0
                     lastCueTime = 0L
+                    stickMissCount = 0
                 }
 
                 // Frame sisa dari ukuran lama (sesaat setelah resize) dilewati.
@@ -363,6 +372,23 @@ class PredictorService : Service() {
                         (table.bottom * img.height).toInt()
                     )
                     handleCue(cue)
+
+                    // Stik dicari hanya jika bola putih ditemukan (garis stik melewati bola putih)
+                    if (cue != null) {
+                        val stick = StickDetector.detect(
+                            plane.buffer, img.width, img.height,
+                            plane.rowStride, plane.pixelStride,
+                            cue.x * img.width,
+                            cue.y * img.height,
+                            (table.left * img.width).toInt(),
+                            (table.top * img.height).toInt(),
+                            (table.right * img.width).toInt(),
+                            (table.bottom * img.height).toInt()
+                        )
+                        handleStick(stick)
+                    } else {
+                        handleStick(null)
+                    }
                 }
             } finally {
                 img.close()
@@ -428,6 +454,39 @@ class PredictorService : Service() {
         }
     }
 
+    /** Thread capture. Sudut dihaluskan sedikit; kembali ke slider manual jika stik tidak terlihat. */
+    private fun handleStick(stick: StickState?) {
+        if (stick != null) {
+            stickMissCount = 0
+            val prev = detectedAim
+            val angle = if (prev != null) {
+                var delta = stick.aimAngleDeg - prev.aimAngleDeg
+                while (delta > 180f) delta -= 360f
+                while (delta < -180f) delta += 360f
+                if (kotlin.math.abs(delta) < 15f) {
+                    var a = prev.aimAngleDeg + 0.6f * delta
+                    while (a > 180f) a -= 360f
+                    while (a <= -180f) a += 360f
+                    a
+                } else {
+                    stick.aimAngleDeg
+                }
+            } else {
+                stick.aimAngleDeg
+            }
+            detectedAim = StickState(angle, stick.votes)
+            overlayDirty = true
+            mainHandler.post { refreshStatus() }
+        } else {
+            stickMissCount++
+            if (stickMissCount >= Config.STICK_MISS_LIMIT && detectedAim != null) {
+                detectedAim = null
+                overlayDirty = true
+                mainHandler.post { refreshStatus() }
+            }
+        }
+    }
+
     private fun stopCapture() {
         displayListener?.let { displayManager?.unregisterDisplayListener(it) }
         displayListener = null
@@ -439,6 +498,7 @@ class PredictorService : Service() {
         captureHandler = null
         tableRegion = null
         detectedCue = null
+        detectedAim = null
     }
 
     private fun setCaptureStatus(text: String) {
@@ -458,6 +518,14 @@ class PredictorService : Service() {
             "Bola putih: mencari..."
         } else {
             "Bola putih: (${(cue.x * realW).toInt()}, ${(cue.y * realH).toInt()})"
+        }
+        val aim = detectedAim
+        stickStatusText?.text = if (virtualDisplay == null || cue == null) {
+            "Sudut: manual"
+        } else if (aim == null) {
+            "Sudut: manual (stik tak terlihat)"
+        } else {
+            "Sudut: %.1f° (stik)".format(aim.aimAngleDeg)
         }
         val t = tableRegion
         tableStatusText?.text = if (virtualDisplay == null) {
@@ -581,11 +649,19 @@ class PredictorService : Service() {
         }
         cueStatusText = cueText
 
+        val stickText = TextView(this).apply {
+            text = "Sudut: manual"
+            setTextColor(theme.textPrimary)
+            textSize = 11f
+        }
+        stickStatusText = stickText
+
         container.addView(titleText)
         container.addView(infoText)
         container.addView(captureText)
         container.addView(tableText)
         container.addView(cueText)
+        container.addView(stickText)
         container.addView(angleSlider)
         container.addView(powerSlider)
 
@@ -813,7 +889,9 @@ class PredictorService : Service() {
             // Meja sudah terdeteksi tetapi bola putih belum: jangan gambar garis dari posisi palsu
             if (detected && cueState == null) return
 
-            val angleRad = (mockAimAngleDeg * PI / 180.0).toFloat()
+            // Sudut dari stik asli jika terdeteksi; selain itu dari slider manual
+            val effectiveAngleDeg = detectedAim?.aimAngleDeg ?: mockAimAngleDeg
+            val angleRad = (effectiveAngleDeg * PI / 180.0).toFloat()
             val prediction = ShotGeometry.calculateShot(
                 cueBall = cueBall,
                 objectBalls = mockObjectBalls,
